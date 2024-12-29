@@ -76,6 +76,8 @@ var (
 	singleGroup    singleflight.Group
 	config         Config
 	allowedOrigins sync.Map
+	// 添加文件锁映射
+	fileLocks sync.Map
 )
 
 // ModifyActionType 定义修改动作类型的枚举值
@@ -328,7 +330,7 @@ func mainProxyHandler(w http.ResponseWriter, r *http.Request) {
 			}
 
 			// 读取未压缩的缓存文件
-			data, err := os.ReadFile(cachePath)
+			data, err := readCacheFile(cachePath)
 			if err != nil {
 				http.Error(w, err.Error(), http.StatusInternalServerError)
 				return
@@ -412,28 +414,39 @@ func mainProxyHandler(w http.ResponseWriter, r *http.Request) {
 					var reader io.ReadCloser = response.Body
 					defer response.Body.Close()
 
-					// 响应压缩算法
+					// 获取预期的Content-Length
+					expectedLength := response.ContentLength
+
+					// 处理压缩
+					var err error
 					switch response.Header.Get("Content-Encoding") {
 					case "gzip":
-						gzReader, err := gzip.NewReader(response.Body)
-						if err != nil {
-							return err
+						if gzReader, err := gzip.NewReader(response.Body); err == nil {
+							reader = gzReader
+							expectedLength = -1 // 压缩的内容长度未知
+						} else {
+							return fmt.Errorf("failed to create gzip reader: %w", err)
 						}
-						defer gzReader.Close()
-						reader = gzReader
 					case "deflate":
 						reader = flate.NewReader(response.Body)
-						defer reader.Close()
+						expectedLength = -1
 					case "br":
 						reader = io.NopCloser(brotli.NewReader(response.Body))
-						// brotli.Reader 不需要关闭
+						expectedLength = -1
 					}
 
-					body, err := io.ReadAll(reader)
+					// 安全地读取响应体
+					body, err := safeReadResponseBody(reader, expectedLength)
 					if err != nil {
-						return err
+						return fmt.Errorf("failed to read response body: %w", err)
 					}
-					// 这里插入内容是临时的，用于修改index.html，此时对于原始数据的解压已经完成
+
+					// 关闭读取器
+					if closer, ok := reader.(io.Closer); ok {
+						closer.Close()
+					}
+
+					// 处理特殊路径
 					if r.URL.Path == "/" {
 						body, err = modifyIndexHTML(body)
 						if err != nil {
@@ -445,13 +458,19 @@ func mainProxyHandler(w http.ResponseWriter, r *http.Request) {
 						body = modifyWorkerHostJS(body)
 					}
 
+					// 验证数据完整性
+					if len(body) == 0 {
+						return fmt.Errorf("empty response body")
+					}
+
+					// 更新响应
 					response.Body = io.NopCloser(bytes.NewReader(body))
-					response.Header.Set("Content-Length", strconv.Itoa(len(body))) // 更新Content-Length头
-					// 更新Content-Encoding头
+					response.Header.Set("Content-Length", strconv.Itoa(len(body)))
 					response.Header.Del("Content-Encoding")
 
+					// 写入缓存前再次验证数据
 					if err := writeCacheFile(cachePath, body); err != nil {
-						return err
+						return fmt.Errorf("failed to write cache file: %w", err)
 					}
 				}
 			} else {
@@ -703,8 +722,31 @@ func isDomainAllowedCallApi(host string, c Config) bool {
 	return false
 }
 
-// 添加一个新的函数来处理缓存写入
+// 获取文件的读写锁
+func getFileLock(path string) *sync.RWMutex {
+	lock, _ := fileLocks.LoadOrStore(path, &sync.RWMutex{})
+	return lock.(*sync.RWMutex)
+}
+
+// 修改文件读取逻辑
+func readCacheFile(cachePath string) ([]byte, error) {
+	fileLock := getFileLock(cachePath)
+	fileLock.RLock()
+	defer fileLock.RUnlock()
+
+	data, err := os.ReadFile(cachePath)
+	if err != nil {
+		return nil, err
+	}
+	return data, nil
+}
+
+// 修改writeCacheFile函数
 func writeCacheFile(cachePath string, body []byte) error {
+	fileLock := getFileLock(cachePath)
+	fileLock.Lock()
+	defer fileLock.Unlock()
+
 	_, err, _ := singleGroup.Do(cachePath, func() (interface{}, error) {
 		// 确保目录存在
 		if err := os.MkdirAll(filepath.Dir(cachePath), 0755); err != nil {
@@ -718,37 +760,42 @@ func writeCacheFile(cachePath string, body []byte) error {
 		}
 		tmpPath := tmpFile.Name()
 
+		// 创建一个清理函数，但暂时不执行
+		cleanup := func() {
+			if tmpFile != nil {
+				utils.UnlockFile(tmpFile)
+				tmpFile.Close()
+				os.Remove(tmpPath)
+			}
+		}
+
 		// 获取文件锁
 		if err := utils.LockFile(tmpFile); err != nil {
-			tmpFile.Close()
-			os.Remove(tmpPath)
+			cleanup()
 			return nil, fmt.Errorf("failed to lock file: %w", err)
 		}
 
-		// 确保函数返回前解锁和清理
-		defer func() {
-			utils.UnlockFile(tmpFile)
-			tmpFile.Close()
-			os.Remove(tmpPath)
-		}()
-
 		// 写入数据
 		if _, err := tmpFile.Write(body); err != nil {
+			cleanup()
 			return nil, fmt.Errorf("failed to write to temp file: %w", err)
 		}
 
 		// 强制同步到磁盘
 		if err := tmpFile.Sync(); err != nil {
+			cleanup()
 			return nil, fmt.Errorf("failed to sync temp file: %w", err)
 		}
 
 		// 关闭文件（保持锁定）
 		if err := tmpFile.Close(); err != nil {
+			cleanup()
 			return nil, fmt.Errorf("failed to close temp file: %w", err)
 		}
 
 		// 原子性地重命名文件
 		if err := os.Rename(tmpPath, cachePath); err != nil {
+			cleanup()
 			return nil, fmt.Errorf("failed to rename temp file: %w", err)
 		}
 
@@ -757,6 +804,11 @@ func writeCacheFile(cachePath string, body []byte) error {
 		if err == nil {
 			dir.Sync() // 同步目录确保重命名操作持久化
 			dir.Close()
+		}
+
+		// 设置文件权限
+		if err := os.Chmod(cachePath, 0644); err != nil {
+			log.Warn().Err(err).Str("path", cachePath).Msg("Failed to set file permissions")
 		}
 
 		return nil, nil
@@ -811,4 +863,25 @@ func sendLog(msg LogMessage) {
 			Str("url", msg.RequestURL).
 			Msg("Log channel full, message dropped")
 	}
+}
+
+// 添加新的函数来安全地读取响应体
+func safeReadResponseBody(reader io.Reader, expectedLength int64) ([]byte, error) {
+	// 如果知道预期长度，使用LimitReader防止读取过多数据
+	if expectedLength > 0 {
+		reader = io.LimitReader(reader, expectedLength+1) // +1 用于检测是否超出预期长度
+	}
+
+	// 直接使用io.ReadAll读取全部数据
+	body, err := io.ReadAll(reader)
+	if err != nil {
+		return nil, fmt.Errorf("error reading response body: %w", err)
+	}
+
+	// 验证读取的数据长度
+	if expectedLength > 0 && int64(len(body)) != expectedLength {
+		return nil, fmt.Errorf("incomplete read: got %d bytes, expected %d", len(body), expectedLength)
+	}
+
+	return body, nil
 }
